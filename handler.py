@@ -1,248 +1,165 @@
-import runpod
 import os
-import websocket
-import base64
 import json
-import uuid
-import logging
-import urllib.request
-import urllib.parse
-import binascii
-import subprocess
-import librosa
-import shutil
+import base64
 import time
-import torch
+import requests
+import subprocess
+import shutil
+import websocket
+import uuid
+import librosa
 import numpy as np
-from einops import rearrange
-import soundfile as sf
-from transformers import Wav2Vec2Config, Wav2Vec2Model as HF_Wav2Vec2Model, Wav2Vec2FeatureExtractor
-from transformers.modeling_outputs import BaseModelOutput
+import torch
 import torch.nn.functional as F
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
+import pyloudnorm as pyln
+from huggingface_hub import hf_hub_download
+import logging
 
-try:
-    import pyloudnorm as pyln
-except ImportError:
-    pyln = None
+import runpod
+from runpod.serverless.utils import rp_download, rp_cleanup, rp_upload
+from runpod.serverless.utils.rp_validator import Validator
 
-# Logging setup
+# Logger setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def loudness_norm(audio_array, sr=16000, lufs=-23):
-    if pyln is None:
-        return audio_array
-    meter = pyln.Meter(sr)
-    try:
-        loudness = meter.integrated_loudness(audio_array)
-        if abs(loudness) > 100:
-            return audio_array
-        normalized_audio = pyln.normalize.loudness(audio_array, loudness, lufs)
-        return normalized_audio
-    except Exception as e:
-        logger.warning(f"Loudness normalization failed: {e}")
-        return audio_array
+# Environment setup for HF Transfer
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-def truncate_base64_for_log(base64_str, max_length=50):
-    if not base64_str:
-        return "None"
-    if len(base64_str) <= max_length:
-        return base64_str
-    return f"{base64_str[:max_length]}... (total {len(base64_str)} chars)"
+# --- Model Configuration ---
+MODELS = [
+    {"repo": "Kijai/WanVideo_comfy_fp8_scaled", "filename": "InfiniteTalk/Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors", "subfolder": "", "target": "/ComfyUI/models/diffusion_models/Wan2_1-InfiniteTalk-Single_fp8_e4m3fn_scaled_KJ.safetensors"},
+    {"repo": "Kijai/WanVideo_comfy_fp8_scaled", "filename": "InfiniteTalk/Wan2_1-InfiniteTalk-Multi_fp8_e4m3fn_scaled_KJ.safetensors", "subfolder": "", "target": "/ComfyUI/models/diffusion_models/Wan2_1-InfiniteTalk-Multi_fp8_e4m3fn_scaled_KJ.safetensors"},
+    {"repo": "Kijai/WanVideo_comfy", "filename": "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors", "subfolder": "", "target": "/ComfyUI/models/diffusion_models/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"},
+    {"repo": "Kijai/WanVideo_comfy", "filename": "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "subfolder": "", "target": "/ComfyUI/models/loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"},
+    {"repo": "Kijai/WanVideo_comfy", "filename": "Wan2_1_VAE_bf16.safetensors", "subfolder": "", "target": "/ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors"},
+    {"repo": "Kijai/WanVideo_comfy", "filename": "umt5-xxl-enc-bf16.safetensors", "subfolder": "", "target": "/ComfyUI/models/text_encoders/umt5-xxl-enc-bf16.safetensors"},
+    {"repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged", "filename": "split_files/clip_vision/clip_vision_h.safetensors", "subfolder": "", "target": "/ComfyUI/models/clip_vision/clip_vision_h.safetensors"},
+    {"repo": "Kijai/MelBandRoformer_comfy", "filename": "MelBandRoformer_fp16.safetensors", "subfolder": "", "target": "/ComfyUI/models/diffusion_models/MelBandRoformer_fp16.safetensors"}
+]
 
-server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
+def download_models():
+    """Download models if they don't exist, leveraging HF Transfer."""
+    for model in MODELS:
+        target_path = model["target"]
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 1000:
+            logger.info(f"✅ Model exists: {target_path}")
+            continue
+        
+        logger.info(f"⏳ Downloading {model['filename']} from {model['repo']}...")
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        try:
+            downloaded = hf_hub_download(repo_id=model["repo"], filename=model["filename"])
+            shutil.copy(downloaded, target_path)
+            logger.info(f"✅ Downloaded to: {target_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to download {model['filename']}: {e}")
+
+# Helpers from modal_infinitetalk_v2
+class CustomWav2Vec2Model(Wav2Vec2Model):
+    def __init__(self, config):
+        super().__init__(config)
+    def forward(self, extract_features, attention_mask=None):
+        res = self.encoder(extract_features, attention_mask=attention_mask)
+        return res.last_hidden_state
+
+def linear_interpolation(features, target_len):
+    if features.shape[0] == target_len: return features
+    features = features.transpose(0, 1).unsqueeze(0)
+    features = F.interpolate(features, size=target_len, mode='linear', align_corners=False)
+    return features.squeeze(0).transpose(0, 1)
+
+def get_embedding(speech_array, wav2vec_fe, wav2vec_model, device="cuda"):
+    inputs = wav2vec_fe(speech_array, sampling_rate=16000, return_tensors="pt", padding=True)
+    input_values = inputs.input_values.to(device)
+    with torch.no_grad():
+        extract_features = wav2vec_model.feature_extractor(input_values)
+        extract_features = extract_features.transpose(1, 2)
+        res = wav2vec_model(extract_features)
+    return linear_interpolation(res, target_len=int(len(speech_array)/16000 * 30))
+
+def loudness_norm(audio_path, target_db=-23.0):
+    data, rate = librosa.load(audio_path, sr=None)
+    meter = pyln.Meter(rate)
+    loudness = meter.integrated_loudness(data)
+    normed = pyln.normalize.loudness(data, loudness, target_db)
+    librosa.output.write_wav(audio_path, normed, rate) if hasattr(librosa, 'output') else None # Older librosa
+    import soundfile as sf
+    sf.write(audio_path, normed, rate)
+
+def get_workflow_path(input_type, person_count):
+    if input_type == "image": return "I2V_single.json"
+    return "V2V_single.json"
+
+def calculate_max_frames_from_audio(wav_path, fps=30):
+    duration = librosa.get_duration(filename=wav_path)
+    return int(duration * fps)
+
+# Initialization
+download_models()
+server_address = "127.0.0.1"
 client_id = str(uuid.uuid4())
 
-# --- Embedding Model Logic (Ported from modal_infinitetalk_v2) ---
-
-def linear_interpolation(features, seq_len):
-    features = features.transpose(1, 2)
-    output_features = F.interpolate(features, size=seq_len, align_corners=True, mode='linear')
-    return output_features.transpose(1, 2)
-
-class CustomWav2Vec2Model(HF_Wav2Vec2Model):
-    def forward(
-        self,
-        input_values,
-        seq_len,
-        attention_mask=None,
-        mask_time_indices=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        extract_features = self.feature_extractor(input_values)
-        extract_features = extract_features.transpose(1, 2)
-        extract_features = linear_interpolation(extract_features, seq_len=seq_len)
-
-        if attention_mask is not None:
-            attention_mask = self._get_feature_vector_attention_mask(
-                extract_features.shape[1], attention_mask, add_adapter=False
-            )
-
-        hidden_states, extract_features = self.feature_projection(extract_features)
-        hidden_states = self._mask_hidden_states(
-            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
-        )
-
-        encoder_outputs = self.encoder(
-            hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = encoder_outputs[0]
-        if self.adapter is not None:
-            hidden_states = self.adapter(hidden_states)
-
-        if not return_dict:
-            return (hidden_states, ) + encoder_outputs[1:]
-        return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
-
-def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=16000, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    audio_duration = len(speech_array) / sr
-    video_length = audio_duration * 25 
-
-    audio_feature = np.squeeze(
-        wav2vec_feature_extractor(speech_array, sampling_rate=sr).input_values
-    )
-    audio_feature = torch.from_numpy(audio_feature).float().to(device=device)
-    audio_feature = audio_feature.unsqueeze(0)
-
-    with torch.no_grad():
-        embeddings = audio_encoder(audio_feature, seq_len=int(video_length), output_hidden_states=True)
-
-    if not embeddings.hidden_states:
-        logger.error("Fail to extract audio embedding")
-        return None
-
-    audio_emb = torch.stack(embeddings.hidden_states[1:], dim=1).squeeze(0)
-    audio_emb = rearrange(audio_emb, "b s d -> s b d")
-    return audio_emb.cpu().detach()
-
-# --- ComfyUI Helper Functions ---
-
-def download_file_from_url(url, output_path):
-    try:
-        result = subprocess.run(
-            ["wget", "-O", output_path, "--no-verbose", "--timeout=30", url],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            logger.info(f"✅ Downloaded: {url} -> {output_path}")
-            return output_path
-        else:
-            raise Exception(f"wget failed: {result.stderr}")
-    except Exception as e:
-        logger.error(f"❌ Download error: {e}")
-        raise
-
-def process_input(input_data, temp_dir, output_filename, input_type):
-    os.makedirs(temp_dir, exist_ok=True)
-    file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-    if input_type == "path": return input_data
-    elif input_type == "url": return download_file_from_url(input_data, file_path)
-    elif input_type == "base64":
-        decoded_data = base64.b64decode(input_data)
-        with open(file_path, "wb") as f: f.write(decoded_data)
-        return file_path
-    else: raise Exception(f"Unsupported input type: {input_type}")
-
-def queue_prompt(prompt, input_type="image", person_count="single"):
-    url = f"http://{server_address}:8188/prompt"
+def queue_prompt(prompt):
     p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode("utf-8")
-    req = urllib.request.Request(url, data=data)
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req) as response:
-        return json.loads(response.read())
+    data = json.dumps(p).encode('utf-8')
+    req = requests.post(f"http://{server_address}:8188/prompt", data=data)
+    return req.json()
 
-def get_history(prompt_id):
-    url = f"http://{server_address}:8188/history/{prompt_id}"
-    with urllib.request.urlopen(url) as response:
-        return json.loads(response.read())
-
-def get_videos(ws, prompt, input_type="image", person_count="single"):
-    prompt_id = queue_prompt(prompt, input_type, person_count)["prompt_id"]
-    logger.info(f"Executing workflow: prompt_id={prompt_id}")
+def get_videos(ws, prompt, input_type, person_count):
+    prompt_id = queue_prompt(prompt)['prompt_id']
+    output_videos = {}
     while True:
         out = ws.recv()
         if isinstance(out, str):
             message = json.loads(out)
-            if message["type"] == "executing":
-                data = message["data"]
-                if data["node"] is None and data["prompt_id"] == prompt_id:
+            if message['type'] == 'executing':
+                data = message['data']
+                if data['node'] is None and data['prompt_id'] == prompt_id:
                     break
-    history = get_history(prompt_id)[prompt_id]
-    output_videos = {}
-    for node_id, node_output in history["outputs"].items():
-        if "gifs" in node_output:
-            output_videos[node_id] = [v["fullpath"] for v in node_output["gifs"]]
+        else: continue
+    
+    history_req = requests.get(f"http://{server_address}:8188/history/{prompt_id}")
+    history = history_req.json()[prompt_id]
+    for node_id in history['outputs']:
+        node_output = history['outputs'][node_id]
+        if 'gifs' in node_output: output_videos[node_id] = [os.path.join("/ComfyUI/output", x['filename']) for x in node_output['gifs']]
     return output_videos
 
-def get_workflow_path(input_type, person_count):
-    if input_type == "image":
-        return "/I2V_single.json" if person_count == "single" else "/I2V_multi.json"
-    return "/V2V_single.json" if person_count == "single" else "/V2V_multi.json"
-
-def calculate_max_frames_from_audio(wav_path, fps=25):
-    try:
-        duration = librosa.get_duration(path=wav_path)
-        return int(duration * fps) + 81
-    except Exception:
-        return 81
-
 def handler(job):
-    job_input = job.get("input", {})
-    
-    # Payload Alignment
-    if "cond_audio" in job_input and isinstance(job_input["cond_audio"], dict):
-        if "person1" in job_input["cond_audio"]:
-            job_input["wav_url"] = job_input["cond_audio"]["person1"]
-    if "cond_video" in job_input:
-        job_input["image_url"] = job_input["cond_video"]
-
-    task_id = f"task_{uuid.uuid4()}"
-    input_type = job_input.get("input_type", "image")
-    person_count = job_input.get("person_count", "single")
-    temp_dir = f"/tmp/{task_id}"
+    job_input = job["input"]
+    temp_dir = f"/tmp/{uuid.uuid4()}"
     os.makedirs(temp_dir, exist_ok=True)
-
-    # 1. Process Media
-    media_url = job_input.get("image_url") or job_input.get("video_url")
-    media_path = process_input(media_url, temp_dir, "input_media.jpg", "url") if media_url else "/examples/image.jpg"
-
-    # 2. Process Audio & Generate Embeddings
-    wav_url = job_input.get("wav_url")
-    wav_path = process_input(wav_url, temp_dir, "input_audio.wav", "url") if wav_url else "/examples/audio.mp3"
-
-    logger.info("Generating audio embeddings...")
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    wav2vec_dir = "/ComfyUI/models/wav2vec" 
     
+    # Payload Mapping
+    wav_url = job_input.get("cond_audio", {}).get("person1")
+    image_url = job_input.get("cond_video")
+    input_type = job_input.get("input_type", "image")
+    person_count = job_input.get("person_count", 1)
+    
+    if not wav_url or not image_url:
+        return {"error": "Missing cond_audio.person1 or cond_video"}
+
+    # 1. Download Media
+    wav_path = os.path.join(temp_dir, "input.wav")
+    media_path = os.path.join(temp_dir, "input_media")
+    subprocess.run(["wget", "-q", wav_url, "-O", wav_path])
+    subprocess.run(["wget", "-q", image_url, "-O", media_path])
+    
+    # 2. Audio Processing
     try:
-        speech_array, sr = librosa.load(wav_path, sr=16000)
-        speech_array = loudness_norm(speech_array, sr=sr)
+        loudness_norm(wav_path)
+        speech_array, _ = librosa.load(wav_path, sr=16000)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        wav2vec_dir = "/ComfyUI/models/wav2vec"
         wav2vec_fe = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_dir, local_files_only=True)
         wav2vec_model = CustomWav2Vec2Model.from_pretrained(wav2vec_dir, local_files_only=True).to(device)
         audio_embedding = get_embedding(speech_array, wav2vec_fe, wav2vec_model, device=device)
         emb_path = os.path.join(temp_dir, "audio_embedding.pt")
         torch.save(audio_embedding, emb_path)
-        logger.info(f"✅ Embedding saved: {emb_path}")
     except Exception as e:
-        logger.error(f"❌ Embedding failed: {e}")
-        return {"error": f"Embedding failed: {e}"}
+        return {"error": f"Audio processing failed: {e}"}
 
     # 3. ComfyUI Interaction
     workflow = json.load(open(get_workflow_path(input_type, person_count), "r"))
@@ -256,7 +173,6 @@ def handler(job):
     workflow["246"]["inputs"]["value"] = job_input.get("height", 512)
     workflow["270"]["inputs"]["value"] = job_input.get("max_frame") or calculate_max_frames_from_audio(wav_path)
 
-    # WebSocket setup
     ws = websocket.WebSocket()
     for _ in range(30):
         try:
